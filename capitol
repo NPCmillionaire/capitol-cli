@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""capitol — track U.S. House members' stock trades straight from official STOCK Act filings.
+
+Data: House Clerk periodic transaction reports (disclosures-clerk.house.gov) + committee
+assignments from github.com/unitedstates/congress-legislators. Needs `pdftotext` (poppler).
+"""
+import argparse, csv, datetime as dt, io, json, os, re, shutil, sqlite3, subprocess, sys, tempfile
+import time, urllib.request, urllib.error, webbrowser, zipfile, xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+VERSION = "0.1.0"
+UA = f"capitol-cli/{VERSION} (+https://github.com/NPCmillionaire/capitol-cli)"
+HOUSE = "https://disclosures-clerk.house.gov/public_disc"
+LEG = "https://unitedstates.github.io/congress-legislators"
+HOME = os.environ.get("CAPITOL_HOME") or os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "capitol")
+DB = os.path.join(HOME, "capitol.db")
+LATE_DAYS = 45  # STOCK Act: report within 45 days of the transaction
+
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def c(code, s): return f"\033[{code}m{s}\033[0m" if TTY else str(s)
+bold = lambda s: c("1", s); dim = lambda s: c("2", s); red = lambda s: c("31", s)
+green = lambda s: c("32", s); yellow = lambda s: c("33", s); cyan = lambda s: c("36", s)
+def err(*a, **kw): print(*a, file=sys.stderr, flush=True, **kw)
+def die(msg): err(f"capitol: {msg}"); sys.exit(1)
+
+# ── storage ───────────────────────────────────────────────────────────────────
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS filings(
+  doc_id TEXT PRIMARY KEY, year INT, name TEXT, last TEXT, first TEXT, state_dst TEXT,
+  filing_date TEXT, status INT DEFAULT 0, n_tx INT DEFAULT 0, error TEXT);
+CREATE TABLE IF NOT EXISTS trades(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, doc_id TEXT, member TEXT, last TEXT, state_dst TEXT,
+  owner TEXT, asset TEXT, ticker TEXT, asset_type TEXT, type TEXT, tx_date TEXT,
+  notif_date TEXT, filing_date TEXT, amount TEXT, amt_lo INT, amt_hi INT,
+  filing_status TEXT, subholding TEXT, description TEXT);
+CREATE INDEX IF NOT EXISTS t_ticker ON trades(ticker);
+CREATE INDEX IF NOT EXISTS t_last ON trades(last);
+CREATE INDEX IF NOT EXISTS t_tx ON trades(tx_date);
+CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
+"""
+# filings.status: 0 = not fetched, 1 = parsed, 2 = paper/scanned (no text), 3 = error
+
+def db():
+    os.makedirs(HOME, exist_ok=True)
+    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    con.executescript(SCHEMA); return con
+
+def kv_get(con, k, default=None):
+    r = con.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone(); return r[0] if r else default
+def kv_set(con, k, v): con.execute("INSERT OR REPLACE INTO kv VALUES(?,?)", (k, str(v))); con.commit()
+
+# ── http ──────────────────────────────────────────────────────────────────────
+def fetch(url, tries=3):
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=60) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404: raise
+            if i == tries - 1: raise
+        except (urllib.error.URLError, TimeoutError):
+            if i == tries - 1: raise
+        time.sleep(2 ** i)
+
+def iso(mdY):
+    try: return dt.datetime.strptime(mdY.strip(), "%m/%d/%Y").date().isoformat()
+    except (ValueError, AttributeError): return None
+
+# ── PTR parsing ───────────────────────────────────────────────────────────────
+TX = re.compile(r"^(?P<pre>.*?)\s*(?<![A-Za-z])(?P<type>P|S \(partial\)|S|E)\s+(?P<td>\d{2}/\d{2}/\d{4})\s+"
+                r"(?P<nd>\d{2}/\d{2}/\d{4})\s*(?P<amt>.*)$")
+META = re.compile(r"^(?P<k>[A-Z](?: [A-Z])?)\s*:\s?(?P<v>.*)$")
+HEADER = re.compile(r"ID Owner Asset Transaction\s+Type\s+Date Notification\s+Date\s+Amount Cap\.\s+Gains >\s+\$200\?")
+AMT_ONLY = re.compile(r"^\$[\d,]+(?:\s.*)?$")
+OWNERS = {"SP": "spouse", "JT": "joint", "DC": "child"}
+TYPES = {"P": "buy", "S": "sell", "S (partial)": "sell (partial)", "E": "exchange"}
+
+def amount_range(s):
+    nums = [int(x.replace(",", "")) for x in re.findall(r"\$([\d,]+)", s or "")]
+    if not nums: return None, None
+    if s.lower().startswith("over"): return nums[0], None
+    return nums[0], nums[-1]
+
+def finish_asset(t):
+    t["asset"] = re.sub(r"\s+", " ", t["asset"]).strip()
+    tick = re.findall(r"\(([A-Z][A-Z0-9.\-/]{0,9})\)", t["asset"])
+    at = re.findall(r"\[([A-Z]{2})\]", t["asset"])
+    t["ticker"] = tick[-1] if tick else None
+    t["asset_type"] = at[-1] if at else None
+
+def parse_ptr(text):
+    """Turn pdftotext -raw output of a House PTR into a list of trade dicts."""
+    text = re.sub(r"Filing ID #\d+", "\n", text)
+    start = text.find("$200?"); start = start + 5 if start >= 0 else 0
+    m = re.search(r"\* For the complete list of asset type|\nI P O\n|Initial Public Offering", text[start:])
+    body = HEADER.sub("\n", text[start: start + m.start()] if m else text[start:])
+    lines = [l.strip() for l in body.splitlines() if l.strip()]
+    trades, buf, in_note, tail, i = [], [], False, False, 0
+    while i < len(lines):
+        line = lines[i]; i += 1
+        tm = TX.match(line)
+        if tm:
+            asset = " ".join(buf + ([tm["pre"]] if tm["pre"] else [])).strip()
+            amt = tm["amt"].strip()
+            if (not amt or amt.endswith("-") or amt.endswith("Over")) and i < len(lines) and AMT_ONLY.match(lines[i]):
+                amt = f"{amt} {lines[i]}".strip(); i += 1
+            am = re.search(r"Over \$[\d,]+|\$[\d,]+\s*-\s*\$[\d,]+|\$[\d,]+", amt)
+            amt = re.sub(r"\s+", " ", am.group(0)) if am else amt
+            owner = None
+            om = re.match(r"^(SP|JT|DC)\s+(.*)$", asset)
+            if om: owner, asset = OWNERS[om[1]], om[2]
+            lo, hi = amount_range(amt)
+            t = dict(owner=owner or "self", asset=asset, type=TYPES.get(tm["type"], tm["type"]),
+                     tx_date=iso(tm["td"]), notif_date=iso(tm["nd"]), amount=amt, amt_lo=lo, amt_hi=hi,
+                     filing_status=None, subholding=None, description=None)
+            finish_asset(t); trades.append(t)
+            buf, in_note = [], False
+            tail = t["asset_type"] is None  # asset name may continue after a page break
+            continue
+        if tail and trades and not META.match(line):
+            trades[-1]["asset"] += " " + line; finish_asset(trades[-1])
+            tail = trades[-1]["asset_type"] is None
+            continue
+        tail = False
+        mm = META.match(line)
+        if mm and trades:
+            k, v = mm["k"], mm["v"].strip()
+            if k == "F S": trades[-1]["filing_status"] = v
+            elif k == "S O": trades[-1]["subholding"] = v
+            elif k in ("D", "C"):
+                trades[-1]["description"] = v; in_note = len(line) >= 70  # long line = wrapped note
+            buf = []; continue
+        if in_note and trades:  # wrapped description text
+            trades[-1]["description"] = f"{trades[-1]['description']} {line}".strip()
+            in_note = len(line) >= 70
+            continue
+        buf.append(line)
+    return trades
+
+def pdf_text(data):
+    with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+        f.write(data); f.flush()
+        r = subprocess.run(["pdftotext", "-raw", "-enc", "UTF-8", f.name, "-"], capture_output=True)
+        return r.stdout.decode("utf-8", "replace")
+
+# ── sync ──────────────────────────────────────────────────────────────────────
+def load_index(con, year):
+    raw = fetch(f"{HOUSE}/financial-pdfs/{year}FD.zip")
+    xml = zipfile.ZipFile(io.BytesIO(raw)).read(f"{year}FD.xml").decode("utf-8-sig")
+    new = 0
+    for m in ET.fromstring(xml):
+        if (m.findtext("FilingType") or "").strip() != "P": continue
+        g = lambda t: (m.findtext(t) or "").strip()
+        name = " ".join(x for x in (g("First"), g("Last"), g("Suffix")) if x)
+        cur = con.execute("INSERT OR IGNORE INTO filings(doc_id,year,name,last,first,state_dst,filing_date) "
+                          "VALUES(?,?,?,?,?,?,?)", (g("DocID"), year, name, g("Last"), g("First"),
+                                                     g("StateDst"), iso(g("FilingDate"))))
+        new += cur.rowcount
+    con.commit(); return new
+
+def fetch_one(row):
+    try:
+        data = fetch(f"{HOUSE}/ptr-pdfs/{row['year']}/{row['doc_id']}.pdf")
+    except urllib.error.HTTPError as e:
+        return row, None, f"HTTP {e.code}"
+    except Exception as e:
+        return row, None, str(e)
+    return row, pdf_text(data), None
+
+def cmd_sync(a):
+    if not shutil.which("pdftotext"):
+        die("needs pdftotext. Install poppler: brew install poppler | pacman -S poppler | apt install poppler-utils")
+    con = db(); this = dt.date.today().year
+    years = range(a.since or this - 1, this + 1)
+    for y in years:
+        try: n = load_index(con, y); err(f"{y}: index ok, {n} new filing(s)")
+        except Exception as e: err(yellow(f"{y}: index failed: {e}"))
+    q = "SELECT * FROM filings WHERE status=0" + (" OR status=3" if a.retry else "")
+    todo = [dict(r) for r in con.execute(q + " ORDER BY filing_date DESC")]
+    if not todo: err("up to date."); return
+    err(f"fetching {len(todo)} report(s) with {a.workers} worker(s)…")
+    done = paper = errs = ntx = 0
+    with ThreadPoolExecutor(a.workers) as ex:
+        for fut in as_completed([ex.submit(fetch_one, r) for r in todo]):
+            row, text, e = fut.result(); done += 1
+            if e:
+                errs += 1; con.execute("UPDATE filings SET status=3,error=? WHERE doc_id=?", (e, row["doc_id"]))
+            elif len(text.strip()) < 40:
+                paper += 1; con.execute("UPDATE filings SET status=2 WHERE doc_id=?", (row["doc_id"],))
+            else:
+                tx = parse_ptr(text)
+                con.execute("DELETE FROM trades WHERE doc_id=?", (row["doc_id"],))
+                for t in tx:
+                    con.execute("INSERT INTO trades(doc_id,member,last,state_dst,filing_date,owner,asset,ticker,"
+                                "asset_type,type,tx_date,notif_date,amount,amt_lo,amt_hi,filing_status,subholding,"
+                                "description) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (row["doc_id"], row["name"], row["last"], row["state_dst"], row["filing_date"],
+                                 t["owner"], t["asset"], t["ticker"], t["asset_type"], t["type"], t["tx_date"],
+                                 t["notif_date"], t["amount"], t["amt_lo"], t["amt_hi"], t["filing_status"],
+                                 t["subholding"], t["description"]))
+                ntx += len(tx)
+                con.execute("UPDATE filings SET status=1,n_tx=?,error=NULL WHERE doc_id=?", (len(tx), row["doc_id"]))
+            if done % 25 == 0 or done == len(todo):
+                con.commit()
+                if sys.stderr.isatty(): err(f"\r  {done}/{len(todo)}  trades:{ntx}  paper:{paper}  errors:{errs}", end="")
+    con.commit(); err("")
+    err(f"done: {ntx} trades from {done - paper - errs} reports; {paper} scanned paper filing(s) "
+        f"(see `capitol paper`); {errs} error(s)" + (" — retry with `capitol sync --retry`" if errs else ""))
+    kv_set(con, "synced_at", dt.datetime.now().isoformat(timespec="seconds"))
+
+# ── querying ──────────────────────────────────────────────────────────────────
+def build_query(a):
+    w, p = [], []
+    if getattr(a, "member", None): w.append("(member LIKE ? OR last LIKE ?)"); p += [f"%{a.member}%"] * 2
+    if getattr(a, "ticker", None):
+        ts = [t.upper() for t in a.ticker.replace(",", " ").split()]
+        w.append(f"ticker IN ({','.join('?' * len(ts))})"); p += ts
+    if getattr(a, "asset", None): w.append("asset LIKE ?"); p.append(f"%{a.asset}%")
+    if getattr(a, "state", None): w.append("state_dst LIKE ?"); p.append(a.state.upper() + "%")
+    if getattr(a, "type", None): w.append("type LIKE ?"); p.append(a.type + "%")
+    if getattr(a, "owner", None): w.append("owner = ?"); p.append(a.owner)
+    if getattr(a, "since", None): w.append("tx_date >= ?"); p.append(a.since)
+    if getattr(a, "until", None): w.append("tx_date <= ?"); p.append(a.until)
+    if getattr(a, "min", None): w.append("COALESCE(amt_hi, amt_lo) >= ?"); p.append(a.min)
+    if getattr(a, "stocks", False): w.append("asset_type IN ('ST','OP')")
+    if getattr(a, "late", False):
+        w.append(f"julianday(filing_date) - julianday(tx_date) > {LATE_DAYS}")
+    return (" WHERE " + " AND ".join(w)) if w else "", p
+
+SORTS = {"tx": "tx_date DESC, id DESC", "filed": "filing_date DESC, id DESC",
+         "amount": "COALESCE(amt_hi, amt_lo, 0) DESC, tx_date DESC"}
+
+def late_days(r):
+    try: return (dt.date.fromisoformat(r["filing_date"]) - dt.date.fromisoformat(r["tx_date"])).days
+    except (TypeError, ValueError): return None
+
+def short_amt(r):
+    lo, hi = r["amt_lo"], r["amt_hi"]
+    def k(n):
+        return f"${n/1e6:g}M" if n >= 1e6 else f"${n/1e3:g}K" if n >= 1e3 else f"${n}"
+    if lo is None: return r["amount"] or "?"
+    if lo % 1000 == 1: lo -= 1  # ranges are $1,001–$15,000 etc.
+    return f"{k(lo)}+" if hi is None or hi == lo else f"{k(lo)}–{k(hi)}"
+
+def print_trades(rows, fmt):
+    rows = [dict(r) for r in rows]
+    for r in rows: r["days_to_file"] = late_days(r)
+    if fmt == "json": print(json.dumps(rows, indent=2)); return
+    if fmt == "csv":
+        if rows:
+            w = csv.DictWriter(sys.stdout, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
+        return
+    if not rows: print(dim("no trades match. (run `capitol sync` first?)")); return
+    for r in rows:
+        t = r["type"] or "?"
+        tcol = green(f"{t:<5}") if t == "buy" else red(f"{t[:5]:<5}") if t.startswith("sell") else yellow(f"{t[:5]:<5}")
+        late = r["days_to_file"]
+        flag = red(f" LATE {late}d") if late is not None and late > LATE_DAYS else ""
+        tick = cyan(f"{r['ticker']:<6}") if r["ticker"] else dim(f"{(r['asset_type'] or '--'):<6}")
+        own = "" if r["owner"] == "self" else dim(f" [{r['owner']}]")
+        asset = re.sub(r"\s*\[[A-Z]{2}\]$", "", r["asset"] or "")
+        print(f"{r['tx_date'] or '?':<10}  {tcol} {tick} {short_amt(r):<12} "
+              f"{bold(r['member'])} {dim(r['state_dst'])}{own}{flag}")
+        print(f"{'':<19}{dim(asset[:90])}")
+    print(dim(f"\n{len(rows)} trade(s)"))
+
+def cmd_trades(a):
+    con = db(); where, p = build_query(a)
+    rows = con.execute(f"SELECT * FROM trades{where} ORDER BY {SORTS[a.sort]} LIMIT ?", p + [a.limit]).fetchall()
+    print_trades(rows, a.format)
+    if not kv_get(con, "synced_at"): err(dim("tip: no data yet — run `capitol sync`"))
+
+def cmd_top(a):
+    con = db(); where, p = build_query(a)
+    key = {"member": "member || ' ' || state_dst", "ticker": "ticker", "asset": "asset"}[a.by]
+    extra = " AND ticker IS NOT NULL" if a.by == "ticker" else ""
+    if extra and not where: extra = " WHERE ticker IS NOT NULL"
+    rows = con.execute(f"""SELECT {key} AS k, COUNT(*) n,
+        SUM(CASE WHEN type='buy' THEN 1 ELSE 0 END) buys,
+        SUM(CASE WHEN type LIKE 'sell%' THEN 1 ELSE 0 END) sells,
+        SUM((COALESCE(amt_lo,0)+COALESCE(amt_hi,amt_lo,0))/2) est,
+        SUM(CASE WHEN julianday(filing_date)-julianday(tx_date) > {LATE_DAYS} THEN 1 ELSE 0 END) late
+        FROM trades{where}{extra} GROUP BY k ORDER BY {'est' if a.sort == 'volume' else 'n'} DESC LIMIT ?""",
+        p + [a.limit]).fetchall()
+    if a.format == "json": print(json.dumps([dict(r) for r in rows], indent=2)); return
+    print(dim(f"{'':<4}{a.by:<40}{'trades':>7}{'buys':>6}{'sells':>6}{'est. volume':>14}{'late':>6}"))
+    for i, r in enumerate(rows, 1):
+        print(f"{i:>3} {str(r['k'])[:39]:<40}{r['n']:>7}{r['buys']:>6}{r['sells']:>6}"
+              f"{'$' + format(int(r['est'] or 0), ','):>14}{(red(r['late']) if r['late'] else dim(0)):>{6 + (9 if TTY else 0)}}")
+    print(dim("\nest. volume = sum of range midpoints (filings only disclose ranges)"))
+
+# ── legislators / committees ──────────────────────────────────────────────────
+def legislators():
+    os.makedirs(HOME, exist_ok=True)
+    out = {}
+    for name in ("legislators-current", "committee-membership-current", "committees-current"):
+        path = os.path.join(HOME, f"{name}.json")
+        if not os.path.exists(path) or time.time() - os.path.getmtime(path) > 7 * 86400:
+            try:
+                data = fetch(f"{LEG}/{name}.json")
+                with open(path, "wb") as f: f.write(data)
+            except Exception as e:
+                if not os.path.exists(path): die(f"couldn't download {name}: {e}")
+        with open(path) as f: out[name] = json.load(f)
+    return out
+
+def find_rep(L, state_dst, last):
+    st, dist = state_dst[:2], state_dst[2:]
+    dist = 0 if dist in ("AL", "00", "") else int(dist) if dist.isdigit() else None
+    for l in L["legislators-current"]:
+        t = l["terms"][-1]
+        if t["type"] == "rep" and t["state"] == st and t.get("district") == dist:
+            return l
+    for l in L["legislators-current"]:
+        if l["terms"][-1]["type"] == "rep" and l["name"]["last"].lower() == last.lower():
+            return l
+
+def committees_for(L, bioguide):
+    names = {}
+    for cm in L["committees-current"]:
+        names[cm["thomas_id"]] = cm["name"]
+        for sc in cm.get("subcommittees", []): names[cm["thomas_id"] + sc["thomas_id"]] = sc["name"]
+    out = []
+    for cid, members in L["committee-membership-current"].items():
+        for m in members:
+            if m.get("bioguide") == bioguide:
+                out.append((cid, names.get(cid, cid), m.get("title"))); break
+    return sorted(out)
+
+def cmd_member(a):
+    con = db()
+    hits = con.execute("SELECT member, last, state_dst, COUNT(*) n FROM trades WHERE member LIKE ? OR last LIKE ? "
+                       "GROUP BY member, state_dst ORDER BY n DESC", (f"%{a.name}%",) * 2).fetchall()
+    if not hits: die(f"no trades found for '{a.name}'. Run `capitol sync`, or try a last name.")
+    if len(hits) > 1 and not a.first:
+        print("multiple matches — refine, or pass --first:")
+        for h in hits: print(f"  {h['member']} ({h['state_dst']}) — {h['n']} trades")
+        return
+    h = hits[0]
+    L = legislators(); rep = find_rep(L, h["state_dst"], h["last"])
+    print(bold(h["member"]) + dim(f"  {h['state_dst']}"))
+    if rep:
+        t = rep["terms"][-1]
+        print(dim(f"  {t.get('party','')} · in House since {rep['terms'][0]['start'][:4]} · bioguide {rep['id']['bioguide']}"))
+        cms = committees_for(L, rep["id"]["bioguide"])
+        full = [x for x in cms if len(x[0]) == 4]; subs = [x for x in cms if len(x[0]) > 4]
+        if full:
+            print("\n" + bold("Committees"))
+            for cid, nm, title in full:
+                print(f"  {nm}" + (yellow(f"  ({title})") if title else ""))
+                for sid, snm, st in subs:
+                    if sid.startswith(cid): print(dim(f"    └ {snm}") + (yellow(f" ({st})") if st else ""))
+    s = con.execute(f"""SELECT COUNT(*) n, MIN(tx_date) a, MAX(tx_date) b,
+        SUM(CASE WHEN julianday(filing_date)-julianday(tx_date) > {LATE_DAYS} THEN 1 ELSE 0 END) late,
+        SUM((COALESCE(amt_lo,0)+COALESCE(amt_hi,amt_lo,0))/2) est
+        FROM trades WHERE member=? AND state_dst=?""", (h["member"], h["state_dst"])).fetchone()
+    print("\n" + bold("Trading") + f"  {s['n']} trades {s['a']} → {s['b']} · est. ${int(s['est'] or 0):,} · "
+          + (red(f"{s['late']} filed late") if s["late"] else green("0 late")))
+    tops = con.execute("SELECT ticker, COUNT(*) n FROM trades WHERE member=? AND state_dst=? AND ticker IS NOT NULL "
+                       "GROUP BY ticker ORDER BY n DESC LIMIT 12", (h["member"], h["state_dst"])).fetchall()
+    if tops: print("  top tickers: " + ", ".join(f"{cyan(r['ticker'])}×{r['n']}" for r in tops))
+    paper = con.execute("SELECT COUNT(*) FROM filings WHERE last=? AND state_dst=? AND status=2",
+                        (h["last"], h["state_dst"])).fetchone()[0]
+    if paper: print(yellow(f"  + {paper} scanned paper filing(s) not parsed — `capitol paper -m {h['last']}`"))
+    print("\n" + bold("Recent"))
+    print_trades(con.execute("SELECT * FROM trades WHERE member=? AND state_dst=? ORDER BY tx_date DESC LIMIT ?",
+                             (h["member"], h["state_dst"], a.limit)).fetchall(), "table")
+
+def cmd_paper(a):
+    con = db(); w, p = "status=2", []
+    if a.member: w += " AND (name LIKE ? OR last LIKE ?)"; p += [f"%{a.member}%"] * 2
+    rows = con.execute(f"SELECT * FROM filings WHERE {w} ORDER BY filing_date DESC LIMIT ?", p + [a.limit]).fetchall()
+    for r in rows:
+        print(f"{r['filing_date']}  {r['name']} {dim(r['state_dst'])}  {HOUSE}/ptr-pdfs/{r['year']}/{r['doc_id']}.pdf")
+    print(dim(f"\n{len(rows)} scanned filing(s) — these are images; open them to read the trades."))
+
+def cmd_pdf(a):
+    con = db(); r = con.execute("SELECT year FROM filings WHERE doc_id=?", (a.doc_id,)).fetchone()
+    url = f"{HOUSE}/ptr-pdfs/{r['year'] if r else dt.date.today().year}/{a.doc_id}.pdf"
+    print(url); webbrowser.open(url)
+
+# ── watch ─────────────────────────────────────────────────────────────────────
+def notify(target, title, body):
+    if target.startswith("ntfy:"):
+        topic = target[5:]
+        url = topic if topic.startswith("http") else f"https://ntfy.sh/{topic}"
+        req = urllib.request.Request(url, data=body.encode(), headers={"Title": title, "User-Agent": UA, "Tags": "classical_building"})
+    elif target.startswith("http"):
+        req = urllib.request.Request(target, data=json.dumps({"title": title, "text": body}).encode(),
+                                     headers={"Content-Type": "application/json", "User-Agent": UA})
+    else: die("--notify must be ntfy:<topic> or a webhook URL")
+    urllib.request.urlopen(req, timeout=20).read()
+
+def cmd_watch(a):
+    if not a.no_sync:
+        a2 = argparse.Namespace(since=None, workers=4, retry=False)
+        try: cmd_sync(a2)
+        except SystemExit: raise
+    con = db(); where, p = build_query(a)
+    key = f"watch:{a.name}"; last = int(kv_get(con, key, -1))
+    top_id = con.execute("SELECT COALESCE(MAX(id),0) FROM trades").fetchone()[0]
+    if last < 0 and not a.all:
+        kv_set(con, key, top_id)
+        print(dim(f"watch '{a.name}' initialised — future runs show only new trades. (use --all to see everything now)"))
+        return
+    where = (where + " AND" if where else " WHERE") + " id > ?"
+    rows = con.execute(f"SELECT * FROM trades{where} ORDER BY tx_date DESC", p + [max(last, 0)]).fetchall()
+    kv_set(con, key, top_id)
+    if not rows and a.format == "table": print(dim("no new trades.")); return
+    print_trades(rows, a.format)
+    if rows and a.notify:
+        lines = [f"{r['member']} ({r['state_dst']}) {r['type']} {r['ticker'] or (r['asset'] or '')[:30]} {short_amt(r)} on {r['tx_date']}" for r in rows[:20]]
+        if len(rows) > 20: lines.append(f"…and {len(rows) - 20} more")
+        notify(a.notify, f"{len(rows)} new congressional trade(s)", "\n".join(lines))
+        err(dim(f"sent notification to {a.notify}"))
+
+def cmd_status(a):
+    con = db()
+    s = {r[0]: r[1] for r in con.execute("SELECT status, COUNT(*) FROM filings GROUP BY status")}
+    n = con.execute("SELECT COUNT(*), MIN(tx_date), MAX(tx_date) FROM trades").fetchone()
+    print(f"db:        {DB}\nsynced:    {kv_get(con, 'synced_at', 'never')}\n"
+          f"filings:   {sum(s.values())} (parsed {s.get(1,0)}, paper {s.get(2,0)}, pending {s.get(0,0)}, errors {s.get(3,0)})\n"
+          f"trades:    {n[0]} ({n[1]} → {n[2]})")
+
+# ── cli ───────────────────────────────────────────────────────────────────────
+def add_filters(sp):
+    sp.add_argument("-m", "--member", help="member name (partial ok)")
+    sp.add_argument("-t", "--ticker", help="ticker(s), comma/space separated")
+    sp.add_argument("--asset", help="asset name contains (e.g. 'Treasury')")
+    sp.add_argument("--state", help="state or state+district, e.g. TX or CA11")
+    sp.add_argument("--type", choices=["buy", "sell", "exchange"])
+    sp.add_argument("--owner", choices=["self", "spouse", "joint", "child"])
+    sp.add_argument("--since", help="trade date ≥ YYYY-MM-DD"); sp.add_argument("--until", help="trade date ≤ YYYY-MM-DD")
+    sp.add_argument("--min", type=int, help="minimum amount (upper bound of range), e.g. 50000")
+    sp.add_argument("--stocks", action="store_true", help="only stocks & options (skip bonds, funds, etc.)")
+    sp.add_argument("--late", action="store_true", help=f"only trades filed > {LATE_DAYS} days after the trade")
+
+def main():
+    p = argparse.ArgumentParser(prog="capitol", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Track U.S. House members' stock trades from official STOCK Act filings.",
+        epilog="examples:\n  capitol sync --since 2024\n  capitol trades -t NVDA --since 2026-01-01\n"
+               "  capitol trades --late --min 50000\n  capitol top --by ticker --type buy --since 2026-07-01\n"
+               "  capitol member pelosi\n  capitol watch -t NVDA,TSLA --notify ntfy:my-secret-topic")
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("sync", help="download & parse House filings")
+    s.add_argument("--since", type=int, help="first year to fetch (default: last year). Data goes back to 2008")
+    s.add_argument("--workers", type=int, default=4); s.add_argument("--retry", action="store_true", help="retry failed downloads")
+    s.set_defaults(fn=cmd_sync)
+
+    t = sub.add_parser("trades", help="list trades"); add_filters(t)
+    t.add_argument("--sort", choices=list(SORTS), default="tx"); t.add_argument("-n", "--limit", type=int, default=50)
+    t.add_argument("--format", choices=["table", "json", "csv"], default="table"); t.set_defaults(fn=cmd_trades)
+
+    tp = sub.add_parser("top", help="leaderboards by member / ticker"); add_filters(tp)
+    tp.add_argument("--by", choices=["member", "ticker", "asset"], default="member")
+    tp.add_argument("--sort", choices=["count", "volume"], default="count")
+    tp.add_argument("-n", "--limit", type=int, default=25)
+    tp.add_argument("--format", choices=["table", "json"], default="table"); tp.set_defaults(fn=cmd_top)
+
+    m = sub.add_parser("member", help="profile: committees, trading summary, recent trades")
+    m.add_argument("name"); m.add_argument("-n", "--limit", type=int, default=15)
+    m.add_argument("--first", action="store_true", help="if several match, use the most active"); m.set_defaults(fn=cmd_member)
+
+    w = sub.add_parser("watch", help="show trades new since last run (cron-friendly), optional push alert"); add_filters(w)
+    w.add_argument("--name", default="default", help="separate watch lists keep separate state")
+    w.add_argument("--notify", help="ntfy:<topic> | ntfy:https://your.server/topic | webhook URL")
+    w.add_argument("--all", action="store_true", help="on first run, show everything instead of initialising")
+    w.add_argument("--no-sync", action="store_true"); w.add_argument("--format", choices=["table", "json", "csv"], default="table")
+    w.set_defaults(fn=cmd_watch)
+
+    pp = sub.add_parser("paper", help="list scanned filings that can't be parsed")
+    pp.add_argument("-m", "--member"); pp.add_argument("-n", "--limit", type=int, default=50); pp.set_defaults(fn=cmd_paper)
+    pd = sub.add_parser("pdf", help="open a filing PDF by doc id"); pd.add_argument("doc_id"); pd.set_defaults(fn=cmd_pdf)
+    st = sub.add_parser("status", help="database stats"); st.set_defaults(fn=cmd_status)
+
+    a = p.parse_args()
+    try: a.fn(a)
+    except KeyboardInterrupt: sys.exit(130)
+    except BrokenPipeError: pass
+
+if __name__ == "__main__":
+    main()
